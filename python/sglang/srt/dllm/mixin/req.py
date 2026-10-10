@@ -55,6 +55,23 @@ class ReqDllmMixin:
             prompt_len + self.sampling_params.max_new_tokens
         )
 
+    def dllm_handoff_error(self: Req) -> Optional[str]:
+        """Why a prefill server could not hand this request on, if it could not."""
+        if self.dllm_config.routing_chunk_size is None:
+            return None
+        if self.sampling_params.max_new_tokens <= 0:
+            return "a prefill-decode request needs at least one token to generate"
+        prompt_len = self.dllm_handoff_prompt_len
+        if prompt_len is None:
+            prompt_len = len(self.origin_input_ids)
+        num_tokens = prompt_len + self.sampling_params.max_new_tokens
+        if self.dllm_config.physical_length(num_tokens) == num_tokens:
+            return (
+                f"a request of {num_tokens} tokens does not fit a prefill-decode "
+                "handoff within the model's context length and the KV pool"
+            )
+        return None
+
     def adopt_dllm_handoff_layout(self: Req) -> None:
         """On a decode server, make the request as long as its handoff.
 

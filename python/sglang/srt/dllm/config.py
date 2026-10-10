@@ -132,5 +132,8 @@ class DllmConfig:
             needs_full_prefill=needs_full_prefill,
             routing_chunk_size=routing_chunk_size,
             handoff_slots_per_chunk=handoff_slots_per_chunk,
-            max_physical_length=model_config.context_len,
+            max_physical_length=min(
+                model_config.context_len,
+                cfg.max_total_tokens or model_config.context_len,
+            ),
         )

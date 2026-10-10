@@ -396,8 +396,14 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        num_tokens = len(req.origin_input_ids)
+        if self.scheduler.dllm_config is not None:
+            if self.scheduler.reject_unfit_dllm_handoff(req):
+                return True
+            # A dLLM request holds its whole handoff in the pool.
+            num_tokens = req.dllm_handoff_len()
+        if num_tokens > self.max_total_num_tokens:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {num_tokens} > {self.max_total_num_tokens}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)

@@ -24,8 +24,14 @@ python -m sglang.launch_server --model-path Dream-v0-Base-7B-PrefillingV2 \
 ```
 
 `--dllm-algorithm-config` takes a YAML file with `block_size` (default 32),
-`threshold` (default 0.9) and `rope_factor`. Requests are ordinary `/generate`
-calls; the server inserts the routing slots itself.
+`threshold` (default 0.9), `rope_factor` and `stop_at_eos` (default true).
+Requests are ordinary `/generate` calls; the server inserts the routing slots
+itself.
+
+An answer longer than one block is denoised block by block, and every block
+starts with a full forward of the sequence. With `stop_at_eos` a block that
+holds the end-of-sequence token ends the answer, so the blocks after it are
+not run.
 
 The YaRN factor follows the request length: the trained factor up to the
 trained length (8 up to 16K), then doubling until the scaled context covers
@@ -96,5 +102,7 @@ server.
 - The chunk summaries of the route layers are kept outside the KV pool
   (about 100 MB for a 128K request).
 - Tensor parallel size 1.
-- Under PD: tested with `--mini-lb`, both servers on one GPU, one-block
-  answers; aborted requests and transfer failures are not covered.
+- Under PD: tested with `--mini-lb` and both servers on one GPU, including
+  two-block answers, clients that disconnect mid-request, a prefill server
+  killed mid-transfer, and requests too long for a handoff. Not covered: a
+  decode server that dies, servers on different machines, the Rust router.

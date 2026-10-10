@@ -132,7 +132,9 @@ class SchedulerDllmMixin:
                         self.metrics_reporter.num_generated_tokens += len(
                             req.output_ids
                         )
-                        if req.output_ids:
+                        if req.output_ids or req.to_finish is not None:
+                            # A refused request finishes with its abort reason
+                            # even when it produced no token.
                             req.update_finish_state(
                                 new_accepted_len=len(req.output_ids)
                             )
@@ -221,6 +223,22 @@ class SchedulerDllmMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def reject_unfit_dllm_handoff(self: Scheduler, req: Req) -> bool:
+        """Abort a request that cannot cross from a prefill to a decode server."""
+        if req.to_finish is not None:
+            # Already refused (for example an over-long input): answer with
+            # that reason now instead of sending a stub through the handoff.
+            req.finished_reason, req.to_finish = req.to_finish, None
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return True
+        message = req.dllm_handoff_error()
+        if message is None:
+            return False
+        logger.error(f"Request {req.rid}: {message}")
+        prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        return True
+
     def _hand_off_dllm_kv(self: Scheduler, req: Req) -> None:
         """Send a prefilled request's KV slots to the decode server and stop here.
 
@@ -256,6 +274,8 @@ class SchedulerDllmMixin:
         self.token_to_kv_pool_allocator.free_group_begin()
         for req in reqs:
             if req.finished():
+                if req.req_pool_idx is not None:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
                 continue
             handoff_len = req.dllm_handoff_len()
             slots = self.req_to_token_pool.req_to_token[req.req_pool_idx, :handoff_len]

@@ -631,6 +631,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ``pop_preallocated``).
         """
         if self.scheduler.dllm_config is not None:
+            if self.scheduler.reject_unfit_dllm_handoff(req):
+                return
             req.adopt_dllm_handoff_layout()
         if self._check_if_req_exceed_kv_capacity(req):
             return
