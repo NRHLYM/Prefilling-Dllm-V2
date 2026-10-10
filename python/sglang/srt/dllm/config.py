@@ -43,6 +43,7 @@ class DllmConfig:
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
             "DreamModel": {"block_size": None, "mask_id": 151666},
+            "PrefillingDreamV2Model": {"block_size": None, "mask_id": 151666},
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -52,7 +53,7 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
-        needs_full_prefill = arch == "DreamModel"
+        needs_full_prefill = arch in ("DreamModel", "PrefillingDreamV2Model")
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests

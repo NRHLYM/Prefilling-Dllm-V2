@@ -54,9 +54,23 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     architectures = model_config_of(server_args).hf_config.architectures
     if (
-        "DreamModel" in architectures
-        and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        "PrefillingDreamV2Model" in architectures
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
     ):
+        logger.warning(
+            "Prefill CUDA graph is disabled because Prefilling-dLLM v2 runs its own attention stack."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_dllm_inference",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        cfg = resolving_view(server_args)
+    if (
+        "DreamModel" in architectures or "PrefillingDreamV2Model" in architectures
+    ) and cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
         logger.warning(
             "Decode CUDA graph is disabled because Dream requires full per-request prefill."
         )
