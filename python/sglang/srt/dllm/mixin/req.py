@@ -29,6 +29,9 @@ class ReqDllmMixin:
         self.dllm_block_offset = 0
         self.dllm_canvas_output_len = 0
         self.dllm_config = dllm_config
+        # Prompt length of a request a decode server holds padded to its
+        # handoff length while the prefill server's KV is in transit.
+        self.dllm_handoff_prompt_len: Optional[int] = None
 
         if self.dllm_config is not None:
             if self.dllm_config.needs_full_prefill:
@@ -42,6 +45,37 @@ class ReqDllmMixin:
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
+
+    def dllm_handoff_len(self: Req) -> int:
+        """KV slots a prefill server hands to the decode server for this request."""
+        prompt_len = self.dllm_handoff_prompt_len
+        if prompt_len is None:
+            prompt_len = len(self.origin_input_ids)
+        return self.dllm_config.physical_length(
+            prompt_len + self.sampling_params.max_new_tokens
+        )
+
+    def adopt_dllm_handoff_layout(self: Req) -> None:
+        """On a decode server, make the request as long as its handoff.
+
+        The decode queues size a request's KV by its input ids. Filler ids
+        stand in for the answer canvas and the routing and summary slots until
+        the transfer lands; ``strip_dllm_handoff_layout`` removes them.
+        """
+        if self.dllm_handoff_prompt_len is not None:
+            return
+        prompt_len = len(self.origin_input_ids)
+        self.dllm_handoff_prompt_len = prompt_len
+        filler = self.dllm_handoff_len() - prompt_len
+        self.origin_input_ids = self.origin_input_ids + array(
+            "q", [self.dllm_config.mask_id] * filler
+        )
+
+    def strip_dllm_handoff_layout(self: Req) -> None:
+        if self.dllm_handoff_prompt_len is None:
+            return
+        self.origin_input_ids = self.origin_input_ids[: self.dllm_handoff_prompt_len]
+        self.dllm_handoff_prompt_len = None
 
     def is_dllm_prefill(self: Req) -> bool:
         return self.dllm_phase in [

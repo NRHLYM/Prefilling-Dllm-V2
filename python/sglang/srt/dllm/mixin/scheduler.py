@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import logging
 from array import array
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    _is_fake_transfer,
+    prepare_abort,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -27,6 +33,8 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+        # Decode server: requests whose prefilled KV has arrived.
+        self.dllm_handoff_queue: List[Req] = []
 
     def get_new_batch_dllm(
         self: Scheduler, running_batch: ScheduleBatch
@@ -104,6 +112,19 @@ class SchedulerDllmMixin:
                         canvas = canvas.tolist()
                     canvas = array("q", canvas)
                     req.full_untruncated_fill_ids = canvas
+
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                        # A prefill server never answers: the request goes on
+                        # to the decode server after its full forward.
+                        error = (algo_states[idx] or {}).get("handoff_error")
+                        if error is not None:
+                            prepare_abort(
+                                req, error, status_code=HTTPStatus.BAD_REQUEST
+                            )
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
+                        else:
+                            self._hand_off_dllm_kv(req)
+                        continue
 
                     if result.dllm_done_per_req_cpu[idx]:
                         req.output_ids = array("q", canvas[len(req.origin_input_ids) :])
@@ -199,6 +220,66 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _hand_off_dllm_kv(self: Scheduler, req: Req) -> None:
+        """Send a prefilled request's KV slots to the decode server and stop here.
+
+        The algorithm left everything the decode server needs in the
+        request's slots, so the stock KV sender carries the whole handoff.
+        """
+        handoff_len = req.dllm_handoff_len()
+        req.kv_committed_len = handoff_len
+        # The transfer metadata carries one output token; the decode server
+        # discards this placeholder.
+        req.output_ids = array("q", [self.dllm_config.mask_id])
+        req.dllm_algo_state = None
+        # send_kv_chunk transfers the request row up to extend_range.end.
+        req.set_extend_range(0, handoff_len)
+        self.dllm_manager.remove_req(req)
+
+        req.time_stats.set_prefill_finished_time()
+        self.disagg_prefill_inflight_queue.append(req)
+        if not req.pending_bootstrap:
+            self.send_kv_chunk(req, last_chunk=True)
+        req.time_stats.set_prefill_transfer_queue_entry_time()
+
+    def finish_dllm_handoffs(self: Scheduler) -> None:
+        """Decode server: answer the requests whose prefilled KV has arrived.
+
+        The algorithm resumes each from its slots and finishes it in one call,
+        so these requests are never batched.
+        """
+        reqs, self.dllm_handoff_queue = self.dllm_handoff_queue, []
+        if not reqs:
+            return
+        worker = self.tp_worker
+        self.token_to_kv_pool_allocator.free_group_begin()
+        for req in reqs:
+            if req.finished():
+                continue
+            handoff_len = req.dllm_handoff_len()
+            slots = self.req_to_token_pool.req_to_token[req.req_pool_idx, :handoff_len]
+            req.strip_dllm_handoff_layout()
+            answer = worker.dllm_algorithm.resume(
+                worker.model_runner,
+                req.origin_input_ids,
+                req.sampling_params.max_new_tokens,
+                slots,
+                transferred=not _is_fake_transfer(req),
+            )
+            req.output_ids = array("q", answer)
+            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            req.dllm_algo_state = None
+            self.metrics_reporter.num_generated_tokens += len(req.output_ids)
+            if req.output_ids:
+                req.update_finish_state(new_accepted_len=len(req.output_ids))
+            if not req.finished():
+                req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+                req.finished_len = len(req.output_ids)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.time_stats.set_completion_time()
+        self.output_streamer.stream_output(reqs, False)
+        self.token_to_kv_pool_allocator.free_group_end()
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
@@ -452,6 +533,11 @@ class DllmManager:
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
+
+    def remove_req(self, req: Req) -> None:
+        """Stop scheduling a request that leaves this server unfinished."""
+        self.waiting_queue = [r for r in self.waiting_queue if r is not req]
+        self.staging_queue = [r for r in self.staging_queue if r is not req]
 
     def increment_inflight_middle_chunks(self) -> None:
         """Increment chunked count for all staging requests."""

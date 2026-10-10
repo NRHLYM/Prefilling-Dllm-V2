@@ -22,6 +22,7 @@ class DllmConfig:
         needs_full_prefill: bool = False,
         routing_chunk_size: Optional[int] = None,
         max_physical_length: Optional[int] = None,
+        handoff_slots_per_chunk: int = 0,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -33,20 +34,26 @@ class DllmConfig:
         # Prefilling-dLLM v2 only: positions per chunk, the last of which is a routing slot.
         self.routing_chunk_size = routing_chunk_size
         self.max_physical_length = max_physical_length
+        # Prefilling-dLLM v2 under prefill-decode disaggregation: extra KV slots per chunk
+        # that carry the chunk summaries to the decode server.
+        self.handoff_slots_per_chunk = handoff_slots_per_chunk
 
     def physical_length(self, num_tokens: int) -> int:
         """KV slots a request of ``num_tokens`` text tokens occupies.
 
         Prefilling-dLLM v2 stores one routing slot after every ``routing_chunk_size - 1``
-        text tokens and fills its last chunk. A request whose layout would not
-        fit the context length keeps its token count; the model then holds
-        that request's keys and values outside the KV pool.
+        text tokens and fills its last chunk; under prefill-decode
+        disaggregation each chunk takes ``handoff_slots_per_chunk`` more. A
+        request whose layout would not fit the context length keeps its token
+        count; the model then holds that request's keys and values outside
+        the KV pool, and such a request cannot be handed to a decode server.
         """
 
         chunk = self.routing_chunk_size
         if not chunk or num_tokens <= 0:
             return num_tokens
-        physical = -(-num_tokens // (chunk - 1)) * chunk
+        num_chunks = -(-num_tokens // (chunk - 1))
+        physical = num_chunks * (chunk + self.handoff_slots_per_chunk)
         if self.max_physical_length is not None and physical > self.max_physical_length:
             return num_tokens
         return physical
@@ -82,12 +89,19 @@ class DllmConfig:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
         needs_full_prefill = arch in ("DreamModel", "PrefillingDreamV2Model")
         routing_chunk_size = None
+        handoff_slots_per_chunk = 0
         if arch == "PrefillingDreamV2Model":
             routing_chunk_size = int(
                 json.loads(
                     (Path(cfg.model_path) / PREFILLING_V2_CONFIG_FILE).read_text()
                 )["chunk_size"]
             )
+            if cfg.disaggregation_mode != "null":
+                # One row per query head of a KV group; see prefilling_v2/handoff.py.
+                hf_config = model_config.hf_config
+                handoff_slots_per_chunk = (
+                    hf_config.num_attention_heads // hf_config.num_key_value_heads
+                )
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
@@ -117,5 +131,6 @@ class DllmConfig:
             first_done_first_out_mode=cfg.dllm_fdfo,
             needs_full_prefill=needs_full_prefill,
             routing_chunk_size=routing_chunk_size,
+            handoff_slots_per_chunk=handoff_slots_per_chunk,
             max_physical_length=model_config.context_len,
         )

@@ -132,9 +132,12 @@ def handle_dllm_inference(server_args: Any):
         logger.warning("Currently LoRA is not supported by diffusion LLM inference.")
         declare_resolution(server_args, "_handle_dllm_inference", enable_lora=False)
 
-    if cfg.disaggregation_mode != "null":
+    # PrefillingDreamV2 hands a request to the decode server after its full forward;
+    # other algorithms have no handoff.
+    if cfg.disaggregation_mode != "null" and cfg.dllm_algorithm != "PrefillingDreamV2":
         logger.warning(
-            "Currently disaggregation is not supported by diffusion LLM inference."
+            "Currently disaggregation is only supported by the PrefillingDreamV2 "
+            "diffusion LLM algorithm."
         )
         declare_resolution(
             server_args,

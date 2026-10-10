@@ -630,6 +630,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if self.scheduler.dllm_config is not None:
+            req.adopt_dllm_handoff_layout()
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -2565,6 +2567,10 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        if self.dllm_config is not None:
+            # A transferred dLLM request is finished in one call, unbatched.
+            self.finish_dllm_handoffs()
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2700,4 +2706,7 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            if self.dllm_config is not None:
+                self.dllm_handoff_queue.extend(transferred_reqs)
+            else:
+                self.waiting_queue.extend(transferred_reqs)

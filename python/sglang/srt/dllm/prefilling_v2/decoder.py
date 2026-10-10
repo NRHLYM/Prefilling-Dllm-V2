@@ -13,8 +13,13 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.dllm.prefilling_v2.layout import build_blocks, build_layout
-from sglang.srt.dllm.prefilling_v2.stack import PrefillingV2Stack
+from sglang.srt.dllm.prefilling_v2.layout import (
+    PrefillingV2Block,
+    PrefillingV2Layout,
+    build_blocks,
+    build_layout,
+)
+from sglang.srt.dllm.prefilling_v2.stack import PrefillingV2Cache, PrefillingV2Stack
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,119 @@ def select_confident(
     return active_rows[selected], token_ids[selected]
 
 
+@dataclass
+class PrefillingV2Plan:
+    """A request laid out for the stack: where its tokens sit and its blocks."""
+
+    layout: PrefillingV2Layout
+    blocks: List[PrefillingV2Block]
+    # Physical token ids on the stack's device; denoising fills them in place.
+    input_ids: torch.Tensor
+    answer_positions: torch.Tensor
+    rope_factor: float
+
+    @property
+    def physical_length(self) -> int:
+        return int(self.input_ids.numel())
+
+
+def plan_request(
+    stack: PrefillingV2Stack,
+    token_ids: torch.Tensor,
+    *,
+    answer_start: int,
+    block_size: int,
+    rope_factor: Optional[float] = None,
+) -> PrefillingV2Plan:
+    """Lay out ``token_ids``, whose tokens from ``answer_start`` on are masks.
+
+    ``rope_factor`` fixes the YaRN factor; by default it follows the sequence
+    length (``PrefillingV2Stack.rope_factor_for``).
+    """
+
+    cfg = stack.config
+    layout = build_layout(
+        token_ids,
+        chunk_size=cfg.chunk_size,
+        mask_token_id=cfg.mask_token_id,
+        pad_token_id=cfg.pad_token_id,
+    )
+    blocks = build_blocks(
+        layout,
+        answer_start=answer_start,
+        block_size=block_size,
+        chunk_size=cfg.chunk_size,
+    )
+    input_ids = layout.input_ids.to(stack.device)
+    answer_positions = layout.text_positions[answer_start:].to(stack.device)
+    if bool((input_ids[answer_positions] != cfg.mask_token_id).any()):
+        raise ValueError("the answer canvas must be fully masked")
+    if rope_factor is None:
+        rope_factor = stack.rope_factor_for(int(input_ids.numel()))
+    return PrefillingV2Plan(
+        layout, blocks, input_ids, answer_positions, float(rope_factor)
+    )
+
+
+@torch.inference_mode()
+def start_block(
+    stack: PrefillingV2Stack,
+    plan: PrefillingV2Plan,
+    block: PrefillingV2Block,
+    *,
+    threshold: float,
+    kv_buffers: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+) -> PrefillingV2Cache:
+    """Forward the whole sequence and commit the block's confident tokens."""
+
+    answer = block.answer_positions.to(stack.device)
+    logits, cache = stack.prefill(
+        plan.input_ids,
+        plan.layout.key_valid,
+        plan.layout.position_ids,
+        plan.layout.routing_positions,
+        block.predictor_positions,
+        rope_factor=plan.rope_factor,
+        kv_buffers=kv_buffers,
+    )
+    rows, tokens = select_confident(
+        logits,
+        torch.arange(answer.numel(), device=stack.device),
+        threshold=threshold,
+        mask_token_id=stack.config.mask_token_id,
+    )
+    plan.input_ids[answer[rows]] = tokens
+    return cache
+
+
+@torch.inference_mode()
+def finish_block(
+    stack: PrefillingV2Stack,
+    plan: PrefillingV2Plan,
+    block: PrefillingV2Block,
+    cache: PrefillingV2Cache,
+    *,
+    threshold: float,
+) -> int:
+    """Run cached forwards until the block has no mask left; returns how many."""
+
+    mask_token_id = stack.config.mask_token_id
+    answer = block.answer_positions.to(stack.device)
+    cached_forwards = 0
+    while True:
+        active = torch.where(plan.input_ids[answer] == mask_token_id)[0]
+        if active.numel() == 0:
+            return cached_forwards
+        logits = stack.cached_forward(
+            plan.input_ids, plan.layout.routing_positions, block, cache
+        )
+        cached_forwards += 1
+        rows, tokens = select_confident(
+            logits, active, threshold=threshold, mask_token_id=mask_token_id
+        )
+        plan.input_ids[answer[rows]] = tokens
+
+
 @torch.inference_mode()
 def generate(
     stack: PrefillingV2Stack,
@@ -58,78 +176,33 @@ def generate(
 ) -> Tuple[torch.Tensor, PrefillingV2GenerationStats]:
     """Denoise ``token_ids[answer_start:]``, which must all be mask tokens.
 
-    ``rope_factor`` fixes the YaRN factor; by default it follows the sequence
-    length (``PrefillingV2Stack.rope_factor_for``). ``kv_buffers_for`` is asked, with
-    the physical sequence length, for per-layer key and value buffers to keep
-    the cache in; it may return None. Returns the answer tokens and the number
-    of forwards spent.
+    ``kv_buffers_for`` is asked, with the physical sequence length, for
+    per-layer key and value buffers to keep the cache in; it may return None.
+    Returns the answer tokens and the number of forwards spent.
     """
 
-    cfg = stack.config
-    device = stack.device
-    layout = build_layout(
+    plan = plan_request(
+        stack,
         token_ids,
-        chunk_size=cfg.chunk_size,
-        mask_token_id=cfg.mask_token_id,
-        pad_token_id=cfg.pad_token_id,
-    )
-    blocks = build_blocks(
-        layout,
         answer_start=answer_start,
         block_size=block_size,
-        chunk_size=cfg.chunk_size,
+        rope_factor=rope_factor,
     )
-    input_ids = layout.input_ids.to(device)
-    answer_positions = layout.text_positions[answer_start:].to(device)
-    if bool((input_ids[answer_positions] != cfg.mask_token_id).any()):
-        raise ValueError("the answer canvas must be fully masked")
-
-    if rope_factor is None:
-        rope_factor = stack.rope_factor_for(int(input_ids.numel()))
     kv_buffers = None
     if kv_buffers_for is not None:
-        kv_buffers = kv_buffers_for(int(input_ids.numel()))
-    full_forwards = cached_forwards = 0
-    for block in blocks:
-        answer = block.answer_positions.to(device)
-        logits, cache = stack.prefill(
-            input_ids,
-            layout.key_valid,
-            layout.position_ids,
-            layout.routing_positions,
-            block.predictor_positions,
-            rope_factor=rope_factor,
-            kv_buffers=kv_buffers,
+        kv_buffers = kv_buffers_for(plan.physical_length)
+    cached_forwards = 0
+    for block in plan.blocks:
+        cache = start_block(
+            stack, plan, block, threshold=threshold, kv_buffers=kv_buffers
         )
-        full_forwards += 1
-        rows, tokens = select_confident(
-            logits,
-            torch.arange(answer.numel(), device=device),
-            threshold=threshold,
-            mask_token_id=cfg.mask_token_id,
-        )
-        input_ids[answer[rows]] = tokens
-        while True:
-            active = torch.where(input_ids[answer] == cfg.mask_token_id)[0]
-            if active.numel() == 0:
-                break
-            logits = stack.cached_forward(
-                input_ids, layout.routing_positions, block, cache
-            )
-            cached_forwards += 1
-            rows, tokens = select_confident(
-                logits,
-                active,
-                threshold=threshold,
-                mask_token_id=cfg.mask_token_id,
-            )
-            input_ids[answer[rows]] = tokens
+        cached_forwards += finish_block(stack, plan, block, cache, threshold=threshold)
         del cache
 
-    return input_ids[answer_positions], PrefillingV2GenerationStats(
-        full_forwards=full_forwards,
+    return plan.input_ids[plan.answer_positions], PrefillingV2GenerationStats(
+        full_forwards=len(plan.blocks),
         cached_forwards=cached_forwards,
-        physical_length=int(input_ids.numel()),
-        rope_factor=float(rope_factor),
+        physical_length=plan.physical_length,
+        rope_factor=plan.rope_factor,
         kv_in_buffers=kv_buffers is not None,
     )
