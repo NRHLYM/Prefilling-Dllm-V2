@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.9)
     parser.add_argument("--rope-factor", type=float, default=None)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--answer-tokens", type=int, default=0)
+    parser.add_argument("--no-stop-at-eos", action="store_true")
     args = parser.parse_args()
 
     hf_config = SimpleNamespace(
@@ -50,6 +52,8 @@ def main():
             if args.limit and record["index"] >= args.limit:
                 break
             prompt = record["prompt_ids"]
+            if args.answer_tokens:
+                record["answer_tokens"] = args.answer_tokens
             token_ids = torch.tensor(
                 prompt + [config.mask_token_id] * record["answer_tokens"],
                 dtype=torch.long,
@@ -62,6 +66,7 @@ def main():
                 block_size=args.block_size,
                 threshold=args.threshold,
                 rope_factor=args.rope_factor,
+                stop_at_eos=not args.no_stop_at_eos,
             )
             torch.cuda.synchronize()
             result = {

@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--answer-tokens", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
 
@@ -52,7 +53,7 @@ def main():
             {
                 "input_ids": record["prompt_ids"],
                 "sampling_params": {
-                    "max_new_tokens": record["answer_tokens"],
+                    "max_new_tokens": args.answer_tokens or record["answer_tokens"],
                     "temperature": 0,
                 },
             },

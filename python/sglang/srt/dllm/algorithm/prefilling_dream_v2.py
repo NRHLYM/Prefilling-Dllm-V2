@@ -7,6 +7,7 @@ from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.prefilling_v2 import handoff
 from sglang.srt.dllm.prefilling_v2.decoder import (
+    close_at_stop_token,
     finish_block,
     generate,
     plan_request,
@@ -61,8 +62,10 @@ class PrefillingDreamV2(DllmAlgorithm):
     (``prefilling_v2/handoff.py``); the decode server resumes from them in ``resume``.
 
     Algorithm config keys: ``block_size`` (default 32), ``threshold``
-    (default 0.9) and ``rope_factor``. The YaRN factor follows the request
-    length unless ``rope_factor`` fixes it.
+    (default 0.9), ``rope_factor`` and ``stop_at_eos`` (default true). The
+    YaRN factor follows the request length unless ``rope_factor`` fixes it.
+    With ``stop_at_eos`` a block that holds the end-of-sequence token ends the
+    answer, so the blocks after it cost no full forward.
     """
 
     def __init__(self, config: DllmConfig):
@@ -77,6 +80,7 @@ class PrefillingDreamV2(DllmAlgorithm):
         self.rope_factor = None if rope_factor is None else float(rope_factor)
         if self.rope_factor is not None and self.rope_factor < 1.0:
             raise ValueError(f"rope_factor must be at least 1, got {rope_factor}")
+        self.stop_at_eos = bool(config.algorithm_config.get("stop_at_eos", True))
         self.hands_off = get_disagg().disaggregation_mode == "prefill"
         if self.hands_off and not self.fdfo:
             raise ValueError("a Prefilling-dLLM v2 prefill server requires --dllm-fdfo")
@@ -213,7 +217,7 @@ class PrefillingDreamV2(DllmAlgorithm):
         if layers is not None:
             kv_buffers = handoff.contiguous_views(*layers, slots, length)
 
-        first = plan.blocks[0]
+        first = block_before = plan.blocks[0]
         received = None
         if transferred and layers is not None:
             cos, sin = stack.rotary(plan.layout.position_ids, plan.rope_factor)
@@ -243,6 +247,9 @@ class PrefillingDreamV2(DllmAlgorithm):
         del cache
         # A later block starts with a full forward of its own, here.
         for block in plan.blocks[1:]:
+            if self.stop_at_eos and close_at_stop_token(stack, plan, block_before):
+                break
+            block_before = block
             cache = start_block(
                 stack, plan, block, threshold=self.threshold, kv_buffers=kv_buffers
             )
@@ -294,6 +301,7 @@ class PrefillingDreamV2(DllmAlgorithm):
                     block_size=self.block_size,
                     threshold=self.threshold,
                     rope_factor=self.rope_factor,
+                    stop_at_eos=self.stop_at_eos,
                     kv_buffers_for=lambda length, s=request_slots: self._kv_buffers(
                         model_runner, s, length
                     ),

@@ -161,6 +161,24 @@ def finish_block(
         plan.input_ids[answer[rows]] = tokens
 
 
+def close_at_stop_token(
+    stack: PrefillingV2Stack, plan: PrefillingV2Plan, block: PrefillingV2Block
+) -> bool:
+    """End the answer after ``block`` if the block holds the end-of-sequence token.
+
+    The blocks after it are filled with that token instead of being denoised,
+    which saves each of them a full forward. Returns whether the answer ended.
+    """
+
+    eos = stack.config.eos_token_id
+    answer = block.answer_positions.to(stack.device)
+    if not bool((plan.input_ids[answer] == eos).any()):
+        return False
+    rest = plan.answer_positions[plan.answer_positions > answer[-1]]
+    plan.input_ids[rest] = eos
+    return True
+
+
 @torch.inference_mode()
 def generate(
     stack: PrefillingV2Stack,
@@ -173,12 +191,15 @@ def generate(
     kv_buffers_for: Optional[
         Callable[[int], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]
     ] = None,
+    stop_at_eos: bool = True,
 ) -> Tuple[torch.Tensor, PrefillingV2GenerationStats]:
     """Denoise ``token_ids[answer_start:]``, which must all be mask tokens.
 
     ``kv_buffers_for`` is asked, with the physical sequence length, for
     per-layer key and value buffers to keep the cache in; it may return None.
-    Returns the answer tokens and the number of forwards spent.
+    With ``stop_at_eos`` a block that holds the end-of-sequence token ends the
+    answer (``close_at_stop_token``). Returns the answer tokens and the number
+    of forwards spent.
     """
 
     plan = plan_request(
@@ -191,16 +212,19 @@ def generate(
     kv_buffers = None
     if kv_buffers_for is not None:
         kv_buffers = kv_buffers_for(plan.physical_length)
-    cached_forwards = 0
+    full_forwards = cached_forwards = 0
     for block in plan.blocks:
         cache = start_block(
             stack, plan, block, threshold=threshold, kv_buffers=kv_buffers
         )
+        full_forwards += 1
         cached_forwards += finish_block(stack, plan, block, cache, threshold=threshold)
         del cache
+        if stop_at_eos and close_at_stop_token(stack, plan, block):
+            break
 
     return plan.input_ids[plan.answer_positions], PrefillingV2GenerationStats(
-        full_forwards=len(plan.blocks),
+        full_forwards=full_forwards,
         cached_forwards=cached_forwards,
         physical_length=plan.physical_length,
         rope_factor=plan.rope_factor,

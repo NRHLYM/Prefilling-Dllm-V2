@@ -33,6 +33,7 @@ class PrefillingV2Config:
     rms_norm_eps: float
     mask_token_id: int
     pad_token_id: int
+    eos_token_id: int
 
     @property
     def head_dim(self) -> int:
@@ -71,6 +72,7 @@ class PrefillingV2Config:
             rms_norm_eps=float(hf_config.rms_norm_eps),
             mask_token_id=int(hf_config.mask_token_id),
             pad_token_id=int(hf_config.pad_token_id),
+            eos_token_id=int(hf_config.eos_token_id),
         )
 
 
