@@ -35,10 +35,6 @@ def main():
         **json.loads((Path(args.model_path) / "config.json").read_text())
     )
     config = PrefillingV2Config.from_files(args.model_path, hf_config)
-    if args.rope_factor is not None:
-        config = PrefillingV2Config(
-            **{**config.__dict__, "rope_factor": args.rope_factor}
-        )
     device = torch.device("cuda")
     stack = PrefillingV2Stack(config, load_from_hf_dir(args.model_path, config, device))
 
@@ -65,6 +61,7 @@ def main():
                 answer_start=len(prompt),
                 block_size=args.block_size,
                 threshold=args.threshold,
+                rope_factor=args.rope_factor,
             )
             torch.cuda.synchronize()
             result = {
@@ -75,6 +72,8 @@ def main():
                 "seconds": time.perf_counter() - started,
                 "full_forwards": stats.full_forwards,
                 "cached_forwards": stats.cached_forwards,
+                "rope_factor": stats.rope_factor,
+                "peak_gpu_gb": torch.cuda.max_memory_allocated() / 2**30,
             }
             sink.write(json.dumps(result) + "\n")
             sink.flush()

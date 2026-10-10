@@ -23,9 +23,18 @@ python -m sglang.launch_server --model-path Dream-v0-Base-7B-PrefillingV2 \
   --disable-radix-cache --max-running-requests 1
 ```
 
-`--dllm-algorithm-config` takes a YAML file with `block_size` (default 32) and
-`threshold` (default 0.9). Requests are ordinary `/generate` calls; the server
-inserts the routing slots itself.
+`--dllm-algorithm-config` takes a YAML file with `block_size` (default 32),
+`threshold` (default 0.9) and `rope_factor`. Requests are ordinary `/generate`
+calls; the server inserts the routing slots itself.
+
+The YaRN factor follows the request length: the trained factor up to the
+trained length (8 up to 16K), then doubling until the scaled context covers
+the request (16 up to 32K, 32 up to 64K, 64 up to 128K). Set `rope_factor` to
+keep one factor for every length.
+
+`--max-total-tokens` must cover the longest request: SGLang reserves KV pool
+slots for it even though the Prefilling-dLLM v2 stack does not read them. A 128K request
+needs about 33 GB on top of the weights and that pool.
 
 Requirements beyond SGLang's: `tilelang` for the route-layer kernels, and the
 FlashAttention 4 build SGLang ships (`flash_attn.cute`) for the windowed

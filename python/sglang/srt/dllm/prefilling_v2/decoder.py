@@ -9,7 +9,7 @@ committed the same way from cached forwards that recompute only the block.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -22,6 +22,7 @@ class PrefillingV2GenerationStats:
     full_forwards: int
     cached_forwards: int
     physical_length: int
+    rope_factor: float
 
 
 def select_confident(
@@ -49,10 +50,13 @@ def generate(
     answer_start: int,
     block_size: int,
     threshold: float,
+    rope_factor: Optional[float] = None,
 ) -> Tuple[torch.Tensor, PrefillingV2GenerationStats]:
     """Denoise ``token_ids[answer_start:]``, which must all be mask tokens.
 
-    Returns the answer tokens and the number of forwards spent.
+    ``rope_factor`` fixes the YaRN factor; by default it follows the sequence
+    length (``PrefillingV2Stack.rope_factor_for``). Returns the answer tokens and the
+    number of forwards spent.
     """
 
     cfg = stack.config
@@ -74,6 +78,8 @@ def generate(
     if bool((input_ids[answer_positions] != cfg.mask_token_id).any()):
         raise ValueError("the answer canvas must be fully masked")
 
+    if rope_factor is None:
+        rope_factor = stack.rope_factor_for(int(input_ids.numel()))
     full_forwards = cached_forwards = 0
     for block in blocks:
         answer = block.answer_positions.to(device)
@@ -83,6 +89,7 @@ def generate(
             layout.position_ids,
             layout.routing_positions,
             block.predictor_positions,
+            rope_factor=rope_factor,
         )
         full_forwards += 1
         rows, tokens = select_confident(
@@ -113,4 +120,5 @@ def generate(
         full_forwards=full_forwards,
         cached_forwards=cached_forwards,
         physical_length=int(input_ids.numel()),
+        rope_factor=float(rope_factor),
     )

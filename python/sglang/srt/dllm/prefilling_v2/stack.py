@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -253,26 +253,44 @@ class PrefillingV2Stack:
             raise ValueError(
                 "the Prefilling-dLLM v2 route kernels are built for 7 query heads per KV head"
             )
-        inv_freq, self.rope_scale = yarn_inverse_frequencies(
-            config.head_dim,
-            config.rope_theta,
-            config.rope_factor,
-            config.rope_original_max_positions,
-        )
-        self.inv_freq = inv_freq.to(self.device)
+        self._rotary_tables: Dict[float, Tuple[torch.Tensor, float]] = {}
         self.route_layers = frozenset(config.route_layers)
         self.q_size = config.num_heads * config.head_dim
         self.kv_size = config.num_kv_heads * config.head_dim
 
     # ---- shared pieces -------------------------------------------------
 
-    def rotary(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def rope_factor_for(self, physical_length: int) -> float:
+        """The YaRN factor a sequence of this length is read with.
+
+        Up to the trained length it is the trained factor. Beyond, it doubles
+        until the scaled context covers the sequence, which is the factor the
+        length sweeps of the paper use at 32K, 64K and 128K.
+        """
+
+        cfg = self.config
+        factor = cfg.rope_factor
+        while factor * cfg.rope_original_max_positions < physical_length:
+            factor *= 2
+        return factor
+
+    def rotary(
+        self, position_ids: torch.Tensor, factor: Optional[float] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """cos and sin of shape [1, n, head_dim] in the model dtype."""
 
-        freqs = position_ids.to(self.device).float()[:, None] * self.inv_freq[None, :]
+        cfg = self.config
+        factor = float(cfg.rope_factor if factor is None else factor)
+        if factor not in self._rotary_tables:
+            inv_freq, scale = yarn_inverse_frequencies(
+                cfg.head_dim, cfg.rope_theta, factor, cfg.rope_original_max_positions
+            )
+            self._rotary_tables[factor] = (inv_freq.to(self.device), scale)
+        inv_freq, scale = self._rotary_tables[factor]
+        freqs = position_ids.to(self.device).float()[:, None] * inv_freq[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = (emb.cos() * self.rope_scale).to(self.dtype)
-        sin = (emb.sin() * self.rope_scale).to(self.dtype)
+        cos = (emb.cos() * scale).to(self.dtype)
+        sin = (emb.sin() * scale).to(self.dtype)
         return cos.unsqueeze(0), sin.unsqueeze(0)
 
     def embed(
@@ -459,6 +477,7 @@ class PrefillingV2Stack:
         routing_positions: torch.Tensor,
         logit_rows: torch.Tensor,
         *,
+        rope_factor: Optional[float] = None,
         keep_cache: bool = True,
         observer=None,
     ) -> Tuple[torch.Tensor, Optional[PrefillingV2Cache]]:
@@ -479,7 +498,7 @@ class PrefillingV2Stack:
         key_valid = key_valid.to(device).unsqueeze(0)
         is_routing = torch.zeros(seq_len, dtype=torch.bool, device=device)
         is_routing[routing_positions.to(device)] = True
-        cos, sin = self.rotary(position_ids)
+        cos, sin = self.rotary(position_ids, rope_factor)
         hidden = self.embed(input_ids, is_routing)
         all_positions = torch.arange(seq_len, device=device)
         layer_caches: List[LayerCache] = []

@@ -17,8 +17,9 @@ class PrefillingDreamV2(DllmAlgorithm):
     forward and the cached forwards of every block itself, one request at a
     time, so nothing is carried between scheduling rounds.
 
-    Algorithm config keys: ``block_size`` (default 32) and ``threshold``
-    (default 0.9).
+    Algorithm config keys: ``block_size`` (default 32), ``threshold``
+    (default 0.9) and ``rope_factor``. The YaRN factor follows the request
+    length unless ``rope_factor`` fixes it.
     """
 
     def __init__(self, config: DllmConfig):
@@ -29,6 +30,10 @@ class PrefillingDreamV2(DllmAlgorithm):
             raise ValueError(f"block_size must be positive, got {self.block_size}")
         if not 0.0 <= self.threshold <= 1.0:
             raise ValueError(f"threshold must be in [0, 1], got {self.threshold}")
+        rope_factor = config.algorithm_config.get("rope_factor")
+        self.rope_factor = None if rope_factor is None else float(rope_factor)
+        if self.rope_factor is not None and self.rope_factor < 1.0:
+            raise ValueError(f"rope_factor must be at least 1, got {rope_factor}")
 
     def run(
         self,
@@ -59,6 +64,7 @@ class PrefillingDreamV2(DllmAlgorithm):
                     answer_start=prompt_len,
                     block_size=self.block_size,
                     threshold=self.threshold,
+                    rope_factor=self.rope_factor,
                 )
                 answer = answer.to(dtype=token_ids.dtype)
             answers.append(answer)
