@@ -478,13 +478,17 @@ class PrefillingV2Stack:
         logit_rows: torch.Tensor,
         *,
         rope_factor: Optional[float] = None,
+        kv_buffers: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         keep_cache: bool = True,
         observer=None,
     ) -> Tuple[torch.Tensor, Optional[PrefillingV2Cache]]:
         """Forward the whole physical sequence.
 
         Returns the logits of ``logit_rows`` and, with ``keep_cache``, the
-        per-layer cache the block's cached forwards read.
+        per-layer cache the block's cached forwards read. ``kv_buffers``
+        gives, per layer, a key and a value tensor of shape
+        [seq_len, kv_heads, head_dim] to hold the cache in place of new
+        tensors; the server passes views of its KV pool.
         """
 
         cfg = self.config
@@ -506,6 +510,11 @@ class PrefillingV2Stack:
         for index, layer in enumerate(self.weights.layers):
             x = _rms_norm(hidden, layer.input_norm_weight, cfg.rms_norm_eps)
             q, k, v = self._project(layer, x, cos, sin)
+            if kv_buffers is not None:
+                key_buffer, value_buffer = kv_buffers[index]
+                key_buffer.copy_(k[0])
+                value_buffer.copy_(v[0])
+                k, v = key_buffer.unsqueeze(0), value_buffer.unsqueeze(0)
             if index in self.route_layers:
                 local_output, local_lse = local_attention(
                     q, k, v, key_valid, cfg.route_local_radius, cfg.chunk_size, True

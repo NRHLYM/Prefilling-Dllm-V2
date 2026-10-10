@@ -1,7 +1,12 @@
+import json
+from pathlib import Path
 from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.dllm.prefilling_v2.weights import (
+    CONFIG_FILE as PREFILLING_V2_CONFIG_FILE,
+)
 from sglang.srt.server_args import ServerArgs
 
 
@@ -15,6 +20,8 @@ class DllmConfig:
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
         needs_full_prefill: bool = False,
+        routing_chunk_size: Optional[int] = None,
+        max_physical_length: Optional[int] = None,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -23,6 +30,26 @@ class DllmConfig:
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
         self.needs_full_prefill = needs_full_prefill
+        # Prefilling-dLLM v2 only: positions per chunk, the last of which is a routing slot.
+        self.routing_chunk_size = routing_chunk_size
+        self.max_physical_length = max_physical_length
+
+    def physical_length(self, num_tokens: int) -> int:
+        """KV slots a request of ``num_tokens`` text tokens occupies.
+
+        Prefilling-dLLM v2 stores one routing slot after every ``routing_chunk_size - 1``
+        text tokens and fills its last chunk. A request whose layout would not
+        fit the context length keeps its token count; the model then holds
+        that request's keys and values outside the KV pool.
+        """
+
+        chunk = self.routing_chunk_size
+        if not chunk or num_tokens <= 0:
+            return num_tokens
+        physical = -(-num_tokens // (chunk - 1)) * chunk
+        if self.max_physical_length is not None and physical > self.max_physical_length:
+            return num_tokens
+        return physical
 
     @staticmethod
     def from_server_args(
@@ -54,6 +81,13 @@ class DllmConfig:
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
         needs_full_prefill = arch in ("DreamModel", "PrefillingDreamV2Model")
+        routing_chunk_size = None
+        if arch == "PrefillingDreamV2Model":
+            routing_chunk_size = int(
+                json.loads(
+                    (Path(cfg.model_path) / PREFILLING_V2_CONFIG_FILE).read_text()
+                )["chunk_size"]
+            )
 
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
@@ -82,4 +116,6 @@ class DllmConfig:
             max_running_requests=max_running_requests,
             first_done_first_out_mode=cfg.dllm_fdfo,
             needs_full_prefill=needs_full_prefill,
+            routing_chunk_size=routing_chunk_size,
+            max_physical_length=model_config.context_len,
         )

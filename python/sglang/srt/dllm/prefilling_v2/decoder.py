@@ -9,7 +9,7 @@ committed the same way from cached forwards that recompute only the block.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -23,6 +23,7 @@ class PrefillingV2GenerationStats:
     cached_forwards: int
     physical_length: int
     rope_factor: float
+    kv_in_buffers: bool
 
 
 def select_confident(
@@ -51,12 +52,17 @@ def generate(
     block_size: int,
     threshold: float,
     rope_factor: Optional[float] = None,
+    kv_buffers_for: Optional[
+        Callable[[int], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]
+    ] = None,
 ) -> Tuple[torch.Tensor, PrefillingV2GenerationStats]:
     """Denoise ``token_ids[answer_start:]``, which must all be mask tokens.
 
     ``rope_factor`` fixes the YaRN factor; by default it follows the sequence
-    length (``PrefillingV2Stack.rope_factor_for``). Returns the answer tokens and the
-    number of forwards spent.
+    length (``PrefillingV2Stack.rope_factor_for``). ``kv_buffers_for`` is asked, with
+    the physical sequence length, for per-layer key and value buffers to keep
+    the cache in; it may return None. Returns the answer tokens and the number
+    of forwards spent.
     """
 
     cfg = stack.config
@@ -80,6 +86,9 @@ def generate(
 
     if rope_factor is None:
         rope_factor = stack.rope_factor_for(int(input_ids.numel()))
+    kv_buffers = None
+    if kv_buffers_for is not None:
+        kv_buffers = kv_buffers_for(int(input_ids.numel()))
     full_forwards = cached_forwards = 0
     for block in blocks:
         answer = block.answer_positions.to(device)
@@ -90,6 +99,7 @@ def generate(
             layout.routing_positions,
             block.predictor_positions,
             rope_factor=rope_factor,
+            kv_buffers=kv_buffers,
         )
         full_forwards += 1
         rows, tokens = select_confident(
@@ -121,4 +131,5 @@ def generate(
         cached_forwards=cached_forwards,
         physical_length=int(input_ids.numel()),
         rope_factor=float(rope_factor),
+        kv_in_buffers=kv_buffers is not None,
     )

@@ -90,6 +90,17 @@ class ReqDllmMixin:
                 + self.output_ids
                 + array("q", [self.dllm_config.mask_id] * remaining)
             )
+            num_tokens = len(self.full_untruncated_fill_ids)
+            padding = self.dllm_config.physical_length(num_tokens) - num_tokens
+            if padding > 0 and self.dllm_algo_state is not None:
+                # Prefilling-dLLM v2 lays the request out with routing slots. Trailing
+                # filler makes the scheduler reserve a KV slot for each
+                # physical position; the algorithm reads the first
+                # ``num_tokens`` ids only.
+                self.full_untruncated_fill_ids += array(
+                    "q", [self.dllm_config.mask_id] * padding
+                )
+                self.dllm_algo_state["num_tokens"] = num_tokens
             self.dllm_canvas_output_len = len(self.output_ids)
             self.dllm_initialized = True
             return
