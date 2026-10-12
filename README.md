@@ -94,3 +94,11 @@ RULER probe tooling.
 
 Built on [SGLang](https://github.com/sgl-project/sglang) and its diffusion LLM
 support for Dream.
+
+The route layer was inspired by hierarchical sparse attention
+([HiLS-Attention](https://github.com/Tencent-Hunyuan/HiLS-Attention),
+[arXiv:2607.02980](https://arxiv.org/abs/2607.02980)), and we thank its
+authors. Two kernels under `python/sglang/srt/dllm/prefilling_v2/ops/`,
+`hils_fwd_bwd_head.py` (attention over the selected chunks) and
+`topk_head_softmax.py` (chunk selection), are adapted from the official
+HiLS-Attention implementation; the author notices in those files are kept.
