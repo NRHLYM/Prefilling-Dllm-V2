@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Evaluate trained dense Dream LoRA with Fast-dLLM (full-window FA-SWA wrap)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+
+import torch
+
+from prefilling_v2.fastdllm_v1 import (
+    DreamRouteFastDLLM,
+    FastDLLMGenerationStats,
+    _unwrap_dream_model,
+)
+from prefilling_v2.longbench_eval import (
+    append_jsonl_fsync,
+    build_plain_fastdllm_block_layouts,
+    build_plain_generation_layout,
+    load_resumable_jsonl,
+    merge_evaluation_shards,
+    shard_indices,
+)
+from prefilling_v2.train_fulltext import (
+    _build_model_and_tokenizer,
+    _kernel_fallback_count,
+    _set_seed,
+    parse_args as parse_training_args,
+)
+from scripts.prefilling_v2.eval_longbench_fastdllm_route import score_prediction
+from scripts.prefilling_v2.eval_longbench_mfen import (
+    configure_eval_trainables,
+    decode_answer,
+    load_trainables,
+    tokenize_prompt,
+)
+
+
+def enable_dense_fastdllm_cache(
+    model: torch.nn.Module,
+    *,
+    local_window: int,
+    chunk_size: int,
+    layer_indices: list[int] | None = None,
+) -> int:
+    """Wrap dense adapters as full-window FA-SWA for Fast-dLLM KV capture.
+
+    3 SWA + 1 dense: pass the 7 dense slot indices. Wrapping every layer
+    would replace radius-1280 SWA with a full-window kernel.
+    """
+    from prefilling_v2.attention import KernelDreamSlidingWindowAttention
+
+    core = _unwrap_dream_model(model)
+    want = None if layer_indices is None else set(int(i) for i in layer_indices)
+    replaced = 0
+    for idx, layer in enumerate(core.model.layers):
+        if want is not None and idx not in want:
+            continue
+        source = getattr(layer.self_attn, "source_attn", layer.self_attn)
+        layer.self_attn = KernelDreamSlidingWindowAttention(
+            source,
+            int(local_window),
+            int(chunk_size),
+            allow_fallback=False,
+            skip_inert_slots=False,
+        )
+        replaced += 1
+    if replaced == 0:
+        raise RuntimeError("dense Fast-dLLM cache wrap replaced zero layers")
+    return replaced
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--training_config", required=True)
+    parser.add_argument("--task", default="multifieldqa_en")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--data", default=None)
+    parser.add_argument("--data_root", default="")
+    parser.add_argument("--prompt_config", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--physical_length", type=int, default=16384)
+    parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument(
+        "--local_window",
+        type=int,
+        default=16384,
+        help="FA-SWA wrap window; must equal physical_length for dense.",
+    )
+    parser.add_argument("--answer_tokens", type=int, default=64)
+    parser.add_argument("--block_length", type=int, default=32)
+    parser.add_argument("--threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--bootstrap", choices=("first_token", "confidence"), default="confidence"
+    )
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--merge", action="store_true")
+    parser.add_argument("--allow_empty_predictions", action="store_true")
+    parser.set_defaults(model_variant="dream_dense_dolmaruler_sync_s1000_fastdllm")
+    return parser
+
+
+def _read_jsonl(path: str | Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def make_record(
+    *,
+    args: argparse.Namespace,
+    rank: int,
+    index: int,
+    example: dict[str, object],
+    prediction: str,
+    prompt_metadata: dict[str, int | str],
+    seconds: float,
+    generation_stats: FastDLLMGenerationStats,
+    fallback_count: int,
+) -> dict[str, object]:
+    answers = [str(answer) for answer in example.get("answers", [])]
+    all_classes = example.get("all_classes")
+    classes = [str(item) for item in all_classes] if all_classes else None
+    score, metric = score_prediction(
+        args.task, prediction, answers, all_classes=classes
+    )
+    return {
+        "task": args.task,
+        "rank": int(rank),
+        "index": int(index),
+        "example_id": example.get("_id", index),
+        "question": example.get("input", ""),
+        "prediction": prediction,
+        "answers": answers,
+        "score": score,
+        "metric": metric,
+        "length": example.get("length"),
+        "prompt_metadata": prompt_metadata,
+        "seconds": float(seconds),
+        "model_variant": args.model_variant,
+        "cache_mode": "dense_fullwindow_fa_swa",
+        "physical_length": int(args.physical_length),
+        "answer_tokens": int(args.answer_tokens),
+        "block_length": int(args.block_length),
+        "threshold": float(args.threshold),
+        "bootstrap": args.bootstrap,
+        "chunk_size": int(args.chunk_size),
+        "local_window": int(args.local_window),
+        "full_prefills": generation_stats.full_prefills,
+        "cached_forwards": generation_stats.cached_forwards,
+        "routing_calls": generation_stats.routing_calls,
+        "recomputed_tokens": generation_stats.recomputed_tokens,
+        "peak_memory_bytes": generation_stats.peak_memory_bytes,
+        "fallback_count": int(fallback_count),
+    }
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.physical_length <= 0 or args.physical_length % args.chunk_size:
+        raise ValueError("physical_length must be positive and divisible by chunk_size")
+    if args.chunk_size < 2:
+        raise ValueError("chunk_size must be at least 2")
+    if int(args.local_window) != int(args.physical_length):
+        raise ValueError("dense eval local_window must equal physical_length")
+    if args.answer_tokens <= 0 or args.block_length <= 0:
+        raise ValueError("answer_tokens and block_length must be positive")
+    if args.answer_tokens % args.block_length:
+        raise ValueError("answer_tokens must be divisible by block_length")
+    if not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("threshold must be in [0,1]")
+    if not args.merge and args.rank is None:
+        raise ValueError("--rank is required unless --merge is used")
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    _validate_args(args)
+    if args.data is None:
+        args.data = str(Path(args.data_root) / f"{args.task}.jsonl")
+    examples = _read_jsonl(args.data)
+    expected_examples = len(examples)
+    if args.limit > 0:
+        expected_examples = min(expected_examples, args.limit * args.world_size)
+    if args.merge:
+        metrics = merge_evaluation_shards(
+            args.output_dir,
+            total_examples=expected_examples,
+            expected_variant=None,
+            require_nonempty_predictions=not args.allow_empty_predictions,
+        )
+        records = load_resumable_jsonl(Path(args.output_dir) / "merged.jsonl")
+        metric = next(
+            iter({str(record.get("metric", "qa_f1")) for record in records}),
+            "unknown",
+        )
+        metrics["task"] = args.task
+        metrics["metric"] = metric
+        metrics["score_avg"] = metrics["qa_f1"]
+        Path(args.output_dir, "metrics.json").write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(metrics, sort_keys=True), flush=True)
+        return
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"rank-{args.rank}.jsonl"
+    completed = {
+        int(record["index"]) for record in load_resumable_jsonl(output_path)
+    }
+    assigned = shard_indices(len(examples), args.rank, args.world_size)
+    if args.limit > 0:
+        assigned = assigned[: args.limit]
+    pending = [index for index in assigned if index not in completed]
+    templates = json.loads(Path(args.prompt_config).read_text(encoding="utf-8"))
+    if args.task not in templates:
+        raise KeyError(f"missing LongBench prompt template for task={args.task}")
+    template = templates[args.task]
+
+    training_args = parse_training_args(
+        ["--config", args.training_config, "--no_gradient_checkpointing"]
+    )
+    if str(training_args.attention_mode) != "dense":
+        raise ValueError("dense LongBench requires attention_mode=dense")
+    if abs(float(getattr(training_args, "ruler_mix_ratio", 0.0) or 0.0)) > 1e-12:
+        raise ValueError("dense 1:1 eval requires ruler_mix_ratio=0")
+    if not bool(getattr(training_args, "route_sync_ruler_ce", False)):
+        raise ValueError("dense 1:1 eval requires route_sync_ruler_ce")
+    if (
+        training_args.max_length != args.physical_length
+        or training_args.chunk_size != args.chunk_size
+        or not training_args.no_kernel_fallback
+    ):
+        raise ValueError("training config does not match dense 16k Fast-dLLM evaluation")
+    args.model_variant = (
+        f"dream_dense_dolmaruler_sync_s1000_fastdllm_v1_{args.physical_length}"
+    )
+    _set_seed(args.seed + args.rank)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    model, tokenizer, plan = _build_model_and_tokenizer(training_args, device)
+    if getattr(plan, "route_layers", None):
+        raise ValueError("dense evaluation must not install route layers")
+    configure_eval_trainables(model, training_args)
+    trainable_tensors = load_trainables(model, Path(args.checkpoint))
+    sliding = list(getattr(plan, "sliding_window_layers", []) or [])
+    dense_slots = list(getattr(plan, "dense_layers", []) or [])
+    wrap_idx = dense_slots if sliding and dense_slots else None
+    wrapped = enable_dense_fastdllm_cache(
+        model,
+        local_window=int(args.physical_length),
+        chunk_size=int(args.chunk_size),
+        layer_indices=wrap_idx,
+    )
+    if wrap_idx is not None and wrapped != len(wrap_idx):
+        raise RuntimeError(
+            f"hybrid wrap expected {len(wrap_idx)} dense slots, got {wrapped}"
+        )
+    model.eval()
+    decoder = DreamRouteFastDLLM(
+        model=model,
+        mask_token_id=int(tokenizer.mask_token_id),
+        threshold=args.threshold,
+        bootstrap=args.bootstrap,
+        use_cache=True,
+    )
+
+    max_prompt_tokens = args.physical_length - args.answer_tokens
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    print(
+        json.dumps(
+            {
+                "rank": args.rank,
+                "assigned": len(assigned),
+                "pending": len(pending),
+                "model_variant": args.model_variant,
+                "device": str(device),
+                "trainable_tensors": trainable_tensors,
+                "dense_wrapped_layers": wrapped,
+                "sliding_window_layers": sliding,
+                "dense_layers": dense_slots,
+                "dense_cache_wrap_layers": wrap_idx if wrap_idx is not None else "all",
+                "prompt_capacity": max_prompt_tokens,
+            }
+        ),
+        flush=True,
+    )
+
+    for ordinal, index in enumerate(pending, start=1):
+        example = examples[index]
+        prompt_ids, prompt_metadata = tokenize_prompt(
+            tokenizer,
+            template,
+            example,
+            max_prompt_tokens,
+        )
+        layout = build_plain_generation_layout(
+            prompt_ids=prompt_ids,
+            answer_tokens=args.answer_tokens,
+            physical_length=args.physical_length,
+            mask_token_id=int(tokenizer.mask_token_id),
+            pad_token_id=int(pad_token_id),
+        )
+        blocks = build_plain_fastdllm_block_layouts(layout, args.block_length)
+        input_ids = layout.input_ids.unsqueeze(0).to(device)
+        attention_mask = layout.attention_mask.unsqueeze(0).to(device)
+        position_ids = layout.position_ids.unsqueeze(0).to(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        started = time.perf_counter()
+        generated, generation_stats = decoder.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            blocks=blocks,
+            landmark_positions=None,
+        )
+        torch.cuda.synchronize(device)
+        seconds = time.perf_counter() - started
+        answer_ids = generated[0, layout.answer_positions.to(device)].tolist()
+        prediction = decode_answer(tokenizer, answer_ids)
+        fallback_count = _kernel_fallback_count(model)
+        if fallback_count:
+            raise RuntimeError(f"kernel fallback count became {fallback_count}")
+        expected_prefills = args.answer_tokens // args.block_length
+        if (
+            generation_stats.full_prefills != expected_prefills
+            or generation_stats.cached_forwards < expected_prefills
+        ):
+            raise RuntimeError(f"unexpected generation stats: {generation_stats}")
+        record = make_record(
+            args=args,
+            rank=args.rank,
+            index=index,
+            example=example,
+            prediction=prediction,
+            prompt_metadata=prompt_metadata,
+            seconds=seconds,
+            generation_stats=generation_stats,
+            fallback_count=fallback_count,
+        )
+        record["raw_answer_ids"] = answer_ids
+        record["raw_decoded"] = tokenizer.decode(
+            answer_ids, skip_special_tokens=False
+        )
+        append_jsonl_fsync(output_path, record)
+        print(
+            json.dumps(
+                {
+                    "rank": args.rank,
+                    "progress": f"{ordinal}/{len(pending)}",
+                    "index": index,
+                    "score": record["score"],
+                    "seconds": seconds,
+                    "full_prefills": generation_stats.full_prefills,
+                    "cached_forwards": generation_stats.cached_forwards,
+                    "prediction": prediction,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    shard_records = [
+        record
+        for record in load_resumable_jsonl(output_path)
+        if int(record["index"]) in set(assigned)
+    ]
+    summary = {
+        "rank": args.rank,
+        "assigned": len(assigned),
+        "completed": len(shard_records),
+        "model_variant": args.model_variant,
+        "score_avg": (
+            100.0
+            * sum(float(record["score"]) for record in shard_records)
+            / len(shard_records)
+            if shard_records
+            else 0.0
+        ),
+        "metric": next(
+            iter({str(record.get("metric", "qa_f1")) for record in shard_records}),
+            "unknown",
+        ),
+    }
+    (output_dir / f"rank-{args.rank}.summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()
