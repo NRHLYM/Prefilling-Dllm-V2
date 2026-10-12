@@ -7,7 +7,7 @@ The base Dream weights and tokenizer are linked, not copied, and `config.json`
 names the Prefilling-dLLM v2 model class.
 
     python convert_checkpoint.py --checkpoint step-1000 \
-        --training-config hils-s2-qcal-rmsnorm-rand-s1000.json \
+        --training-config v2-s1000.json \
         --base-model Dream-v0-Base-7B --output-dir Dream-v0-Base-7B-PrefillingV2
 """
 
@@ -35,7 +35,7 @@ def convert_state(state):
     tensors, route_layers, lora_layers = {}, set(), set()
     for name, tensor in state.items():
         tensor = tensor.detach().to(torch.float32).contiguous()
-        if name == "dream_hils_lmk_type_embed":
+        if name == "dream_route_lmk_type_embed":
             tensors["prefilling_v2.role_offset"] = tensor
             continue
         match = _LORA.match(name)
@@ -72,7 +72,7 @@ def main():
     tensors, route_layers, lora_layers = convert_state(state)
     train = json.loads(Path(args.training_config).read_text())
 
-    interleave = int(train["hils_interleave"])
+    interleave = int(train["route_interleave"])
     expected = [
         i for i in range(max(lora_layers) + 1) if i % interleave == interleave - 1
     ]
@@ -89,12 +89,12 @@ def main():
         "route_layers": route_layers,
         "chunk_size": int(train["chunk_size"]),
         "route_local_radius": int(train["local_window"]),
-        "route_top_k": int(train["hils_topk"]),
+        "route_top_k": int(train["route_topk"]),
         "sliding_radius": int(train["swa_local_window"]),
         "lora_rank": rank,
         "lora_scaling": float(train["lora_alpha"]) / rank,
         "lora_targets": train["lora_target_modules"],
-        "route_query_rank": int(train["hils_qcal_rank"]),
+        "route_query_rank": int(train["route_qcal_rank"]),
         "entropy_prior_scale": 1.0,
         "rope_theta": float(train["model_rope_theta"]),
         "rope_scaling": train["model_rope_scaling"],

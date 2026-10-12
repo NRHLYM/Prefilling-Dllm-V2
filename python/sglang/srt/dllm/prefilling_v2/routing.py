@@ -1,4 +1,4 @@
-"""Dream G=7 adapters for the official HiLS routing and selected kernels."""
+"""Dream G=7 adapters for the chunk-selection and selected-chunk kernels in ``ops``."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Tensor layout and chunk-mask helpers for the Dream HiLS kernel backend."""
+"""Tensor layout and chunk-mask helpers for the Dream route kernels."""
 
 from __future__ import annotations
 

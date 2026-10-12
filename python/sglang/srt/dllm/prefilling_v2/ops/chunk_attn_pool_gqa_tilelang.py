@@ -1,4 +1,4 @@
-"""Compact native-GQA landmark pooling for the Dream HiLS backend."""
+"""Compact native-GQA landmark pooling for the Dream route layers."""
 
 import math
 

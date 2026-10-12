@@ -83,7 +83,7 @@ The probes are synthesized by the training tree. With it on `PYTHONPATH`:
 
 ```bash
 python benchmark/prefilling_v2/dump_ruler_prompts.py --model-path Dream-v0-Base-7B \
-  --task hils_mkmq --length 16384 --output mk.jsonl
+  --task mkmq --length 16384 --output mk.jsonl
 python benchmark/prefilling_v2/run_server_eval.py --base-url http://127.0.0.1:30000 \
   --prompts mk.jsonl --output mk.out.jsonl
 ```

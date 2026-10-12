@@ -1,7 +1,7 @@
 """Normalization of selected-chunk scores against the local window.
 
-Copied unchanged from ``dream_dllm_hils/attention.py`` of the Prefilling-dLLM v2 training
-tree (``_route_weights_torch``).
+Copied unchanged from the attention module of the Prefilling-dLLM v2 training tree
+(``_route_weights_torch``).
 """
 
 from __future__ import annotations

@@ -5,26 +5,29 @@ download. Run with the training tree (the `training` branch of this repository)
 on PYTHONPATH:
 
     PYTHONPATH=<training tree> python dump_ruler_prompts.py \
-        --model-path Dream-v0-Base-7B --task hils_mkmq --length 16384 --output mk.jsonl
+        --model-path Dream-v0-Base-7B --task mkmq --length 16384 --output mk.jsonl
 """
 
 import argparse
 import json
 
-from dream_dllm_hils.data import RulerDenoisingSynthesizer
+from prefilling_v2.data import RulerDenoisingSynthesizer
 from transformers import AutoTokenizer
 
-from scripts.from_dense16k.eval_jingneng_official_ruler import (
+from scripts.from_dense16k.eval_ruler import (
     TASK_SYNTH_ID,
-    pack_hils_style_prompt,
+    pack_route_style_prompt,
     text_slot_budget,
 )
+
+# The training tree prefixes its task names; the command line takes the short ones.
+TASKS = {name.split("_", 1)[1]: name for name in TASK_SYNTH_ID}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--task", required=True, choices=sorted(TASK_SYNTH_ID))
+    parser.add_argument("--task", required=True, choices=sorted(TASKS))
     parser.add_argument("--length", type=int, required=True)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--num-samples", type=int, default=100)
@@ -35,15 +38,15 @@ def main():
         args.model_path, trust_remote_code=True, local_files_only=True
     )
     synthesizer = RulerDenoisingSynthesizer(
-        tokenizer, task_ids=(TASK_SYNTH_ID[args.task],)
+        tokenizer, task_ids=(TASK_SYNTH_ID[TASKS[args.task]],)
     )
-    slots = text_slot_budget(args.length, hils=True, chunk_size=args.chunk_size)
+    slots = text_slot_budget(args.length, is_route=True, chunk_size=args.chunk_size)
     with open(args.output, "w") as handle:
         for index in range(args.num_samples):
-            prompt_ids, answer_tokens, outputs = pack_hils_style_prompt(
+            prompt_ids, answer_tokens, outputs = pack_route_style_prompt(
                 tokenizer=tokenizer,
                 synthesizer=synthesizer,
-                task=args.task,
+                task=TASKS[args.task],
                 text_slots=slots,
                 sample_index=index,
                 example={},

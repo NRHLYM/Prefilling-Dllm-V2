@@ -410,8 +410,8 @@ class PrefillingV2Stack:
     ) -> torch.Tensor:
         """Select chunks for each query, read them, and mix in the local window."""
 
-        from sglang.srt.dllm.prefilling_v2.ops.hils_bidir_output_fusion_tilelang import (
-            fuse_hils_outputs,
+        from sglang.srt.dllm.prefilling_v2.ops.bidir_output_fusion_tilelang import (
+            fuse_route_outputs,
         )
         from sglang.srt.dllm.prefilling_v2.routing import (
             route_topk_g7,
@@ -460,7 +460,7 @@ class PrefillingV2Stack:
         remote_output = selected_attention_g7_cached(
             q, key, value, remote_weights, indices, key_valid, cfg.chunk_size
         )
-        return fuse_hils_outputs(
+        return fuse_route_outputs(
             remote_output.contiguous(),
             local_output.contiguous(),
             local_weight.contiguous(),

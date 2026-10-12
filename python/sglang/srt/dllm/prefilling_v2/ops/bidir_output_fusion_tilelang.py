@@ -1,4 +1,4 @@
-"""Fused local/remote output combine for bidirectional HiLS attention."""
+"""Fused local/remote output combine for a bidirectional route layer."""
 
 import tilelang
 import tilelang.language as T
@@ -77,7 +77,7 @@ def _fusion_bwd(batch, seq_len, heads, head_dim, threads=128):
     return main
 
 
-class _FuseHiLSOutputs(torch.autograd.Function):
+class _FuseRouteOutputs(torch.autograd.Function):
     @staticmethod
     def forward(ctx, remote_output, local_output, local_weight):
         batch, seq_len, heads, head_dim = remote_output.shape
@@ -102,7 +102,7 @@ class _FuseHiLSOutputs(torch.autograd.Function):
 
 def _validate(remote_output, local_output, local_weight):
     if remote_output.device.type != "cuda":
-        raise ValueError("fuse_hils_outputs requires CUDA tensors")
+        raise ValueError("fuse_route_outputs requires CUDA tensors")
     if not (
         remote_output.device == local_output.device == local_weight.device
     ):
@@ -126,16 +126,16 @@ def _validate(remote_output, local_output, local_weight):
         == local_weight.dtype
         == torch.bfloat16
     ):
-        raise ValueError("fuse_hils_outputs requires BF16 tensors")
+        raise ValueError("fuse_route_outputs requires BF16 tensors")
     if not (
         remote_output.is_contiguous()
         and local_output.is_contiguous()
         and local_weight.is_contiguous()
     ):
-        raise ValueError("fuse_hils_outputs requires contiguous tensors")
+        raise ValueError("fuse_route_outputs requires contiguous tensors")
 
 
-def fuse_hils_outputs(
+def fuse_route_outputs(
     remote_output: torch.Tensor,
     local_output: torch.Tensor,
     local_weight: torch.Tensor,
@@ -143,6 +143,6 @@ def fuse_hils_outputs(
     """Add the weighted local branch to the already weighted remote branch."""
 
     _validate(remote_output, local_output, local_weight)
-    return _FuseHiLSOutputs.apply(
+    return _FuseRouteOutputs.apply(
         remote_output, local_output, local_weight
     )
